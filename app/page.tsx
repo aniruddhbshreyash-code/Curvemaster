@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Upload, Settings, BarChart3, Download, X, CheckCircle2, AlertCircle, Users, AlertTriangle } from 'lucide-react';
 import * as XLSX from 'xlsx';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, Cell, Legend } from 'recharts';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell, Legend } from 'recharts';
 
 // Types
 interface StudentData {
@@ -53,33 +53,49 @@ interface TeamMatchSummary {
 
 type AppState = 'upload' | 'configure' | 'dashboard';
 
-interface ChartTooltipPayload {
-  payload?: ProcessedStudent;
+interface HistogramTooltipPayload {
+  dataKey: string;
+  value: number;
+  color: string;
+  name: string;
 }
 
-interface ChartTooltipProps {
+interface HistogramTooltipProps {
   active?: boolean;
-  payload?: ChartTooltipPayload[];
-  label?: string;
-  teamEnabled: boolean;
+  payload?: HistogramTooltipPayload[];
+  label?: number;
 }
 
 const GRADE_COLORS = {
-  'A': '#10b981',
-  'A-': '#34d399',
-  'B': '#3b82f6',
-  'B-': '#60a5fa',
-  'C': '#eab308',
-  'C-': '#fbbf24',
-  'D': '#f97316',
-  'F': '#ef4444',
+  'A': '#059669',
+  'A-': '#10b981',
+  'B': '#2563eb',
+  'B-': '#3b82f6',
+  'C': '#d97706',
+  'C-': '#f59e0b',
+  'D': '#ea580c',
+  'F': '#dc2626',
 };
 
-// Custom tooltip for the chart
-const CustomChartTooltip = ({ active, payload, label, teamEnabled }: ChartTooltipProps) => {
+const GRADE_LABELS: Record<string, string> = {
+  'A': 'Excellent',
+  'A-': 'Very Good',
+  'B': 'Good',
+  'B-': 'Above Average',
+  'C': 'Average',
+  'C-': 'Below Average',
+  'D': 'Poor',
+  'F': 'Fail',
+};
+
+// Custom tooltip for the histogram
+const HistogramChartTooltip = ({ active, payload, label }: HistogramTooltipProps) => {
   if (!active || !payload || !payload.length) return null;
-  const student = payload[0]?.payload;
-  if (!student) return null;
+
+  const gradeEntries = payload.filter(p => p.value > 0);
+  if (gradeEntries.length === 0) return null;
+
+  const totalCount = gradeEntries.reduce((sum, p) => sum + p.value, 0);
 
   return (
     <div style={{
@@ -90,24 +106,15 @@ const CustomChartTooltip = ({ active, payload, label, teamEnabled }: ChartToolti
       padding: '12px 16px',
       fontSize: '13px',
     }}>
-      <p style={{ color: '#0f172a', fontWeight: 'bold', marginBottom: '6px' }}>{label}</p>
-      {teamEnabled && student.individualComponent !== undefined ? (
-        <>
-          <p style={{ color: '#3b82f6', margin: '2px 0' }}>
-            Individual: {student.individualComponent.toFixed(2)}
-          </p>
-          <p style={{ color: '#8b5cf6', margin: '2px 0' }}>
-            Team: {student.teamComponent?.toFixed(2) ?? '0.00'}
-            {student.teamName ? ` (${student.teamName})` : ' (No Team)'}
-          </p>
-          <hr style={{ margin: '4px 0', borderColor: '#e2e8f0' }} />
-        </>
-      ) : null}
+      <p style={{ color: '#0f172a', fontWeight: 'bold', marginBottom: '6px' }}>Score: {label}</p>
+      {gradeEntries.map((entry, i) => (
+        <p key={i} style={{ color: '#0f172a', margin: '2px 0', fontWeight: 500 }}>
+          {entry.name}: {entry.value} student{entry.value !== 1 ? 's' : ''}
+        </p>
+      ))}
+      <hr style={{ margin: '4px 0', borderColor: '#e2e8f0' }} />
       <p style={{ color: '#0f172a', fontWeight: 600, margin: '2px 0' }}>
-        Final Score: {student.finalScore.toFixed(2)}
-      </p>
-      <p style={{ margin: '2px 0' }}>
-        Grade: <span style={{ color: GRADE_COLORS[student.grade as keyof typeof GRADE_COLORS] || '#64748b', fontWeight: 'bold' }}>{student.grade}</span>
+        Total: {totalCount} student{totalCount !== 1 ? 's' : ''}
       </p>
     </div>
   );
@@ -183,17 +190,15 @@ export default function CurveMaster() {
         
         setNumericColumns(numeric);
 
-        // If not including team projects, go to configure immediately
-        if (!includeTeamProjects) {
-          setState('configure');
-        }
+        // Go to configure immediately after file read
+        setState('configure');
       } catch (error) {
         alert('Error reading file. Please ensure it\'s a valid CSV or Excel file.');
         console.error(error);
       }
     };
     reader.readAsArrayBuffer(file);
-  }, [includeTeamProjects]);
+  }, []);
 
   // Team file upload handler
   const handleTeamFileUpload = useCallback((file: File) => {
@@ -233,12 +238,8 @@ export default function CurveMaster() {
       alert('Please upload the individual students file first.');
       return;
     }
-    if (includeTeamProjects && teamRawData.length === 0) {
-      alert('Please upload the team projects file or uncheck "Include Team Projects".');
-      return;
-    }
     setState('configure');
-  }, [rawData, includeTeamProjects, teamRawData]);
+  }, [rawData]);
 
   // Parse team data and build member→team map
   const parseTeamData = useCallback((): { teams: TeamData[]; memberToTeam: Map<number, { teamName: string; marks: number }> } => {
@@ -585,27 +586,75 @@ export default function CurveMaster() {
     return { inTeams, total: processedData.length };
   }, [teamEnabledInResults, processedData]);
 
-  // Export to Excel
+  // Export modal state
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [exportSelectedColumns, setExportSelectedColumns] = useState<Set<string>>(new Set());
+
+  // Build available export columns
+  const availableExportColumns = useMemo(() => {
+    const cols: string[] = [];
+    if (processedData.length > 0) {
+      // All rawData keys
+      const rawKeys = Object.keys(processedData[0].rawData);
+      cols.push(...rawKeys);
+    }
+    // Conditional team columns
+    if (teamEnabledInResults) {
+      cols.push('Team Name', 'Team Project Score', 'Individual Component', 'Team Component');
+    }
+    // Always
+    cols.push('Final Score', 'Grade');
+    return cols;
+  }, [processedData, teamEnabledInResults]);
+
+  // Initialize export columns when modal opens
+  const openExportModal = useCallback(() => {
+    setExportSelectedColumns(new Set(availableExportColumns));
+    setShowExportModal(true);
+  }, [availableExportColumns]);
+
+  const toggleExportColumn = (col: string) => {
+    setExportSelectedColumns(prev => {
+      const next = new Set(prev);
+      if (next.has(col)) {
+        next.delete(col);
+      } else {
+        next.add(col);
+      }
+      return next;
+    });
+  };
+
+  // Export to Excel with selected columns
   const exportToExcel = () => {
     const exportData = processedData.map(student => {
-      const base: Record<string, string | number> = { ...student.rawData };
+      const full: Record<string, string | number> = { ...student.rawData };
 
       if (teamEnabledInResults) {
-        base['Team Name'] = student.teamName || 'No Team';
-        base['Team Project Score'] = student.teamRawScore ?? 'N/A';
-        base['Individual Component'] = student.individualComponent?.toFixed(2) ?? '';
-        base['Team Component'] = student.teamComponent?.toFixed(2) ?? '0.00';
+        full['Team Name'] = student.teamName || 'No Team';
+        full['Team Project Score'] = student.teamRawScore ?? 'N/A';
+        full['Individual Component'] = student.individualComponent?.toFixed(2) ?? '';
+        full['Team Component'] = student.teamComponent?.toFixed(2) ?? '0.00';
       }
 
-      base['Final Score'] = student.finalScore.toFixed(2);
-      base['Grade'] = student.grade;
-      return base;
+      full['Final Score'] = student.finalScore.toFixed(2);
+      full['Grade'] = student.grade;
+
+      // Filter to only selected columns
+      const filtered: Record<string, string | number> = {};
+      availableExportColumns.forEach(col => {
+        if (exportSelectedColumns.has(col) && full[col] !== undefined) {
+          filtered[col] = full[col];
+        }
+      });
+      return filtered;
     });
 
     const ws = XLSX.utils.json_to_sheet(exportData);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Graded Results');
     XLSX.writeFile(wb, `graded_${fileName}`);
+    setShowExportModal(false);
   };
 
   const reset = () => {
@@ -733,94 +782,10 @@ export default function CurveMaster() {
               </div>
             </div>
 
-            {/* Team Projects Option */}
-            <div className="bg-white rounded-2xl shadow-lg shadow-blue-100/50 border border-slate-200 p-8">
-              <div className="flex items-center gap-3 mb-4">
-                <input
-                  type="checkbox"
-                  id="includeTeamProjects"
-                  checked={includeTeamProjects}
-                  onChange={(e) => setIncludeTeamProjects(e.target.checked)}
-                  className="w-5 h-5 text-blue-600 rounded border-slate-300 focus:ring-2 focus:ring-blue-500"
-                />
-                <label htmlFor="includeTeamProjects" className="text-lg font-semibold text-slate-900 cursor-pointer flex items-center gap-2">
-                  <Users className="w-5 h-5 text-blue-600" />
-                  Include Team Projects?
-                </label>
-              </div>
-
-              {includeTeamProjects && (
-                <div className="space-y-6 animate-fadeIn">
-                  {/* Weightage Input */}
-                  <div className="ml-8">
-                    <label className="block text-sm font-semibold text-slate-900 mb-2">
-                      Team Project Weightage (%)
-                    </label>
-                    <input
-                      type="number"
-                      min="0"
-                      max="100"
-                      value={teamWeightage}
-                      onChange={(e) => {
-                        const val = Math.min(100, Math.max(0, Number(e.target.value) || 0));
-                        setTeamWeightage(val);
-                      }}
-                      className="w-full max-w-xs px-4 py-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-slate-900"
-                    />
-                    <p className="text-xs text-slate-500 mt-1">
-                      Individual component will be weighted at {100 - teamWeightage}%
-                    </p>
-                  </div>
-
-                  {/* Team File Upload */}
-                  <div className="ml-8">
-                    <label className="block text-sm font-semibold text-slate-900 mb-3">
-                      Upload Team Projects File
-                    </label>
-                    <div
-                      className={`border-2 border-dashed rounded-xl p-8 text-center hover:border-purple-500 hover:bg-purple-50/50 transition-all cursor-pointer group ${teamFileName ? 'border-green-400 bg-green-50/30' : 'border-purple-300'}`}
-                      onDragOver={(e) => e.preventDefault()}
-                      onDrop={(e) => {
-                        e.preventDefault();
-                        const file = e.dataTransfer.files[0];
-                        if (file) handleTeamFileUpload(file);
-                      }}
-                      onClick={() => {
-                        const input = document.createElement('input');
-                        input.type = 'file';
-                        input.accept = '.csv,.xlsx,.xls';
-                        input.onchange = (e) => {
-                          const file = (e.target as HTMLInputElement).files?.[0];
-                          if (file) handleTeamFileUpload(file);
-                        };
-                        input.click();
-                      }}
-                    >
-                      {teamFileName ? (
-                        <>
-                          <CheckCircle2 className="w-12 h-12 mx-auto mb-3 text-green-500" />
-                          <p className="text-base font-medium text-slate-900 mb-1">{teamFileName}</p>
-                          <p className="text-sm text-green-600">{teamRawData.length} teams loaded • Click to replace</p>
-                        </>
-                      ) : (
-                        <>
-                          <Users className="w-12 h-12 mx-auto mb-3 text-purple-500 group-hover:scale-110 transition-transform" />
-                          <p className="text-base font-medium text-slate-900 mb-1">
-                            Drop team file here or click to browse
-                          </p>
-                          <p className="text-sm text-slate-500">CSV or Excel with team members and marks</p>
-                        </>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
-
             {/* Proceed Button */}
             <button
               onClick={proceedToConfigure}
-              disabled={rawData.length === 0 || (includeTeamProjects && teamRawData.length === 0)}
+              disabled={rawData.length === 0}
               className="w-full px-6 py-4 bg-gradient-to-r from-blue-600 to-indigo-600 text-white font-semibold rounded-xl hover:from-blue-700 hover:to-indigo-700 disabled:from-slate-300 disabled:to-slate-400 disabled:cursor-not-allowed transition-all shadow-lg shadow-blue-500/25"
             >
               Continue to Configuration →
@@ -843,11 +808,6 @@ export default function CurveMaster() {
                   <div>
                     <p className="text-sm font-medium text-blue-900 mb-1">File Loaded: {fileName}</p>
                     <p className="text-sm text-blue-700">{rawData.length} students • {numericColumns.length} numeric columns detected</p>
-                    {includeTeamProjects && (
-                      <p className="text-sm text-purple-700 mt-1">
-                        Team File: {teamFileName} • {teamRawData.length} teams • Weightage: {teamWeightage}% team / {100 - teamWeightage}% individual
-                      </p>
-                    )}
                   </div>
                 </div>
               </div>
@@ -951,11 +911,72 @@ export default function CurveMaster() {
 
               <button
                 onClick={processData}
-                disabled={selectedColumns.size === 0 || !nameColumn || (includeTeamProjects && (!rollNumberColumn || !teamMarksColumn || hasTeamBlockingErrors))}
+                disabled={selectedColumns.size === 0 || !nameColumn || (includeTeamProjects && (!rollNumberColumn || !teamMarksColumn || hasTeamBlockingErrors || teamRawData.length === 0))}
                 className="w-full mt-8 px-6 py-4 bg-gradient-to-r from-blue-600 to-indigo-600 text-white font-semibold rounded-lg hover:from-blue-700 hover:to-indigo-700 disabled:from-slate-300 disabled:to-slate-400 disabled:cursor-not-allowed transition-all shadow-lg shadow-blue-500/25"
               >
                 Calculate Grades →
               </button>
+            </div>
+
+            {/* ─── Include Team Projects Toggle + File Upload ─── */}
+            <div className="bg-white rounded-2xl shadow-lg shadow-purple-100/50 border border-slate-200 p-8">
+              <div className="flex items-center gap-3 mb-2">
+                <input
+                  type="checkbox"
+                  id="includeTeamProjects"
+                  checked={includeTeamProjects}
+                  onChange={(e) => setIncludeTeamProjects(e.target.checked)}
+                  className="w-5 h-5 text-purple-600 rounded border-slate-300 focus:ring-2 focus:ring-purple-500"
+                />
+                <label htmlFor="includeTeamProjects" className="text-lg font-semibold text-slate-900 cursor-pointer flex items-center gap-2">
+                  <Users className="w-5 h-5 text-purple-600" />
+                  Include Team Projects?
+                </label>
+              </div>
+              <p className="text-xs text-slate-500 ml-8 mb-4">Enable this to factor in team/group project scores alongside individual marks.</p>
+
+              {includeTeamProjects && (
+                <div className="ml-8 animate-fadeIn">
+                  <label className="block text-sm font-semibold text-slate-900 mb-3">
+                    Upload Team Projects File
+                  </label>
+                  <div
+                    className={`border-2 border-dashed rounded-xl p-8 text-center hover:border-purple-500 hover:bg-purple-50/50 transition-all cursor-pointer group ${teamFileName ? 'border-green-400 bg-green-50/30' : 'border-purple-300'}`}
+                    onDragOver={(e) => e.preventDefault()}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      const file = e.dataTransfer.files[0];
+                      if (file) handleTeamFileUpload(file);
+                    }}
+                    onClick={() => {
+                      const input = document.createElement('input');
+                      input.type = 'file';
+                      input.accept = '.csv,.xlsx,.xls';
+                      input.onchange = (e) => {
+                        const file = (e.target as HTMLInputElement).files?.[0];
+                        if (file) handleTeamFileUpload(file);
+                      };
+                      input.click();
+                    }}
+                  >
+                    {teamFileName ? (
+                      <>
+                        <CheckCircle2 className="w-12 h-12 mx-auto mb-3 text-green-500" />
+                        <p className="text-base font-medium text-slate-900 mb-1">{teamFileName}</p>
+                        <p className="text-sm text-green-600">{teamRawData.length} teams loaded • Click to replace</p>
+                      </>
+                    ) : (
+                      <>
+                        <Users className="w-12 h-12 mx-auto mb-3 text-purple-500 group-hover:scale-110 transition-transform" />
+                        <p className="text-base font-medium text-slate-900 mb-1">
+                          Drop team file here or click to browse
+                        </p>
+                        <p className="text-sm text-slate-500">CSV or Excel with team members and marks</p>
+                      </>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* ─── Team Project Configuration Card ─── */}
@@ -966,7 +987,7 @@ export default function CurveMaster() {
                   <h3 className="text-xl font-bold text-slate-900">Team Project Configuration</h3>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
                   {/* Team Marks Column */}
                   <div>
                     <label className="block text-sm font-semibold text-slate-900 mb-2">
@@ -996,6 +1017,27 @@ export default function CurveMaster() {
                       onChange={(e) => setMaxTeamMarks(Number(e.target.value) || 100)}
                       className="w-full px-4 py-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 text-slate-900"
                     />
+                  </div>
+
+                  {/* Team Weightage */}
+                  <div>
+                    <label className="block text-sm font-semibold text-slate-900 mb-2">
+                      Team Weightage (%)
+                    </label>
+                    <input
+                      type="number"
+                      min="0"
+                      max="100"
+                      value={teamWeightage}
+                      onChange={(e) => {
+                        const val = Math.min(100, Math.max(0, Number(e.target.value) || 0));
+                        setTeamWeightage(val);
+                      }}
+                      className="w-full px-4 py-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500 text-slate-900"
+                    />
+                    <p className="text-xs text-slate-500 mt-1">
+                      Individual: {100 - teamWeightage}%
+                    </p>
                   </div>
                 </div>
 
@@ -1082,7 +1124,7 @@ export default function CurveMaster() {
               )}
               <div className="bg-white rounded-xl shadow-lg shadow-blue-100/50 border border-slate-200 p-6">
                 <button
-                  onClick={exportToExcel}
+                  onClick={openExportModal}
                   className="flex items-center justify-center gap-2 w-full h-full px-4 py-3 bg-gradient-to-r from-green-600 to-emerald-600 text-white font-semibold rounded-lg hover:from-green-700 hover:to-emerald-700 transition-all shadow-lg shadow-green-500/25"
                 >
                   <Download className="w-5 h-5" />
@@ -1091,49 +1133,174 @@ export default function CurveMaster() {
               </div>
             </div>
 
-            {/* Chart */}
+            {/* Export Column Selection Modal */}
+            {showExportModal && (
+              <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-center justify-center p-4" onClick={() => setShowExportModal(false)}>
+                <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 w-full max-w-lg max-h-[80vh] flex flex-col animate-fadeIn" onClick={(e) => e.stopPropagation()}>
+                  <div className="p-6 border-b border-slate-200">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-lg font-bold text-slate-900">Select Export Columns</h3>
+                      <button onClick={() => setShowExportModal(false)} className="text-slate-400 hover:text-slate-600 transition-colors">
+                        <X className="w-5 h-5" />
+                      </button>
+                    </div>
+                    <p className="text-sm text-slate-500 mt-1">Choose which columns to include in the exported file.</p>
+                    <div className="flex gap-3 mt-3">
+                      <button
+                        onClick={() => setExportSelectedColumns(new Set(availableExportColumns))}
+                        className="text-xs px-3 py-1.5 bg-blue-50 text-blue-700 rounded-md hover:bg-blue-100 transition-colors font-medium"
+                      >
+                        Select All
+                      </button>
+                      <button
+                        onClick={() => setExportSelectedColumns(new Set())}
+                        className="text-xs px-3 py-1.5 bg-slate-50 text-slate-700 rounded-md hover:bg-slate-100 transition-colors font-medium"
+                      >
+                        Deselect All
+                      </button>
+                    </div>
+                  </div>
+                  <div className="p-6 overflow-y-auto flex-1">
+                    <div className="space-y-2">
+                      {availableExportColumns.map(col => (
+                        <label key={col} className="flex items-center gap-3 p-2 rounded-lg hover:bg-slate-50 cursor-pointer transition-colors">
+                          <input
+                            type="checkbox"
+                            checked={exportSelectedColumns.has(col)}
+                            onChange={() => toggleExportColumn(col)}
+                            className="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-2 focus:ring-blue-500"
+                          />
+                          <span className="text-sm text-slate-800 font-medium">{col}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="p-6 border-t border-slate-200 flex gap-3 justify-end">
+                    <button
+                      onClick={() => setShowExportModal(false)}
+                      className="px-5 py-2.5 text-sm font-medium text-slate-700 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={exportToExcel}
+                      disabled={exportSelectedColumns.size === 0}
+                      className="flex items-center gap-2 px-5 py-2.5 text-sm font-medium text-white bg-gradient-to-r from-green-600 to-emerald-600 rounded-lg hover:from-green-700 hover:to-emerald-700 disabled:from-slate-300 disabled:to-slate-400 disabled:cursor-not-allowed transition-all shadow-md shadow-green-500/20"
+                    >
+                      <Download className="w-4 h-4" />
+                      Download ({exportSelectedColumns.size} columns)
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Stacked Histogram Chart */}
             <div className="bg-white rounded-2xl shadow-lg shadow-blue-100/50 border border-slate-200 p-8">
-              <h3 className="text-xl font-bold text-slate-900 mb-6">Student Performance Distribution</h3>
+              <div className="flex items-center justify-between mb-2">
+                <h3 className="text-xl font-bold text-slate-900">Score Distribution Histogram</h3>
+                <div className="flex items-center gap-1 text-xs text-slate-500">
+                  <span className="inline-block w-3 h-3 rounded-sm" style={{ backgroundColor: GRADE_COLORS['A'] }} />
+                  <span>Excellent</span>
+                  <span className="mx-1">→</span>
+                  <span className="inline-block w-3 h-3 rounded-sm" style={{ backgroundColor: GRADE_COLORS['F'] }} />
+                  <span>Fail</span>
+                </div>
+              </div>
+              <p className="text-sm text-slate-500 mb-6">Each bar shows how many students fall within a 5-point score range, color-coded by grade.</p>
               <div className="overflow-x-auto">
-                <BarChart
-                  width={1000}
-                  height={500}
-                  data={processedData}
-                  margin={{ top: 20, right: 30, left: 20, bottom: 80 }}
-                >
-                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-                  <XAxis 
-                    dataKey="name" 
-                    angle={-45} 
-                    textAnchor="end" 
-                    height={100}
-                    tick={{ fill: '#64748b', fontSize: 12 }}
-                  />
-                  <YAxis tick={{ fill: '#64748b', fontSize: 12 }} />
-                  <Tooltip content={<CustomChartTooltip teamEnabled={teamEnabledInResults} />} />
-                  <Legend />
-                  
-                  <ReferenceLine y={cutoffs.A} stroke={GRADE_COLORS['A']} strokeDasharray="3 3" label={{ value: 'A', fill: GRADE_COLORS['A'], position: 'right' }} />
-                  <ReferenceLine y={cutoffs['A-']} stroke={GRADE_COLORS['A-']} strokeDasharray="3 3" label={{ value: 'A-', fill: GRADE_COLORS['A-'], position: 'right' }} />
-                  <ReferenceLine y={cutoffs.B} stroke={GRADE_COLORS['B']} strokeDasharray="3 3" label={{ value: 'B', fill: GRADE_COLORS['B'], position: 'right' }} />
-                  <ReferenceLine y={cutoffs['B-']} stroke={GRADE_COLORS['B-']} strokeDasharray="3 3" label={{ value: 'B-', fill: GRADE_COLORS['B-'], position: 'right' }} />
-                  <ReferenceLine y={cutoffs.C} stroke={GRADE_COLORS['C']} strokeDasharray="3 3" label={{ value: 'C', fill: GRADE_COLORS['C'], position: 'right' }} />
-                  <ReferenceLine y={cutoffs['C-']} stroke={GRADE_COLORS['C-']} strokeDasharray="3 3" label={{ value: 'C-', fill: GRADE_COLORS['C-'], position: 'right' }} />
-                  <ReferenceLine y={cutoffs.D} stroke={GRADE_COLORS['D']} strokeDasharray="3 3" label={{ value: 'D', fill: GRADE_COLORS['D'], position: 'right' }} />
-                  
-                  <Bar dataKey="finalScore" name="Final Score" radius={[8, 8, 0, 0]}>
-                    {processedData.map((entry, index) => (
-                      <Cell key={`cell-${index}`} fill={GRADE_COLORS[entry.grade as keyof typeof GRADE_COLORS]} />
-                    ))}
-                  </Bar>
-                </BarChart>
+                {(() => {
+                  // Build histogram data grouped into 5-point score bins
+                  const GRADE_KEYS = Object.keys(GRADE_COLORS) as Array<keyof typeof GRADE_COLORS>;
+                  const BIN_SIZE = 5;
+
+                  // Determine range
+                  const scores = processedData.map(s => s.finalScore);
+                  const minScore = Math.floor(Math.min(...scores) / BIN_SIZE) * BIN_SIZE;
+                  const maxScore = Math.ceil(Math.max(...scores) / BIN_SIZE) * BIN_SIZE;
+
+                  // Build bins
+                  const bins = new Map<number, Record<string, number | string>>();
+                  for (let b = minScore; b < maxScore; b += BIN_SIZE) {
+                    const entry: Record<string, number | string> = { binStart: b, label: `${b}–${b + BIN_SIZE}` };
+                    GRADE_KEYS.forEach(g => { entry[g] = 0; });
+                    bins.set(b, entry);
+                  }
+
+                  processedData.forEach(student => {
+                    const bin = Math.floor(student.finalScore / BIN_SIZE) * BIN_SIZE;
+                    const clampedBin = Math.max(minScore, Math.min(bin, maxScore - BIN_SIZE));
+                    const entry = bins.get(clampedBin);
+                    if (entry) {
+                      const grade = student.grade as keyof typeof GRADE_COLORS;
+                      if (typeof entry[grade] === 'number') {
+                        (entry[grade] as number)++;
+                      }
+                    }
+                  });
+
+                  const histogramData = Array.from(bins.values()).sort((a, b) => (a.binStart as number) - (b.binStart as number));
+
+                  return (
+                    <BarChart
+                      width={1000}
+                      height={600}
+                      data={histogramData}
+                      margin={{ top: 30, right: 30, left: 30, bottom: 50 }}
+                      barCategoryGap="12%"
+                    >
+                      <defs>
+                        {GRADE_KEYS.map(grade => (
+                          <linearGradient key={`grad-${grade}`} id={`gradient-${grade}`} x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor={GRADE_COLORS[grade]} stopOpacity={1} />
+                            <stop offset="100%" stopColor={GRADE_COLORS[grade]} stopOpacity={0.7} />
+                          </linearGradient>
+                        ))}
+                      </defs>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
+                      <XAxis
+                        dataKey="label"
+                        tick={{ fill: '#334155', fontSize: 13, fontWeight: 600 }}
+                        tickLine={false}
+                        axisLine={{ stroke: '#cbd5e1' }}
+                        label={{ value: 'Score Range', position: 'insideBottom', offset: -15, fill: '#334155', fontSize: 14, fontWeight: 700 }}
+                      />
+                      <YAxis
+                        allowDecimals={false}
+                        tick={{ fill: '#334155', fontSize: 13, fontWeight: 500 }}
+                        tickLine={false}
+                        axisLine={{ stroke: '#cbd5e1' }}
+                        label={{ value: 'Number of Students', angle: -90, position: 'insideLeft', offset: -5, fill: '#334155', fontSize: 14, fontWeight: 700 }}
+                      />
+                      <Tooltip content={<HistogramChartTooltip />} />
+                      <Legend
+                        formatter={(value: string) => <span style={{ color: '#334155', fontWeight: 600, fontSize: 13 }}>{value} ({GRADE_LABELS[value] || value})</span>}
+                        iconType="square"
+                        iconSize={14}
+                        wrapperStyle={{ paddingTop: 16 }}
+                      />
+                      {GRADE_KEYS.map((grade, i) => (
+                        <Bar
+                          key={grade}
+                          dataKey={grade}
+                          name={grade}
+                          stackId="a"
+                          fill={`url(#gradient-${grade})`}
+                          stroke={GRADE_COLORS[grade]}
+                          strokeWidth={1}
+                          radius={i === GRADE_KEYS.length - 1 ? [6, 6, 0, 0] : [0, 0, 0, 0]}
+                        />
+                      ))}
+                    </BarChart>
+                  );
+                })()}
               </div>
             </div>
 
             {/* Cutoff Sliders */}
             <div className="bg-white rounded-2xl shadow-lg shadow-blue-100/50 border border-slate-200 p-8">
               <h3 className="text-xl font-bold text-slate-900 mb-6">Adjust Grade Cutoffs</h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="grid grid-cols-1 gap-4">
                 {(Object.keys(cutoffs) as Array<keyof GradeCutoffs>).map(grade => (
                   <div key={grade} className="space-y-2">
                     <div className="flex items-center justify-between">
@@ -1170,7 +1337,7 @@ export default function CurveMaster() {
                   const percentage = ((count / processedData.length) * 100).toFixed(1);
                   return (
                     <div key={grade} className="text-center p-4 rounded-lg border border-slate-200 hover:shadow-md transition-shadow">
-                      <div className="w-12 h-12 mx-auto mb-2 rounded-full flex items-center justify-center text-white font-bold text-lg" style={{ backgroundColor: color }}>
+                      <div className="w-12 h-12 mx-auto mb-2 rounded-full flex items-center justify-center text-slate-900 font-bold text-lg" style={{ backgroundColor: color, opacity: 0.85 }}>
                         {grade}
                       </div>
                       <p className="text-2xl font-bold text-slate-900">{count}</p>
